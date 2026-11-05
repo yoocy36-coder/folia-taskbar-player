@@ -183,18 +183,61 @@ module.exports = function activate(api) {
     // leaves a window that Windows no longer routes clicks to after the
     // fullscreen app goes away, so the controller is hidden while it lasts and
     // rebuilt fresh afterwards.
-    const hostIsFullscreen = () => {
-        const windows = BrowserWindow.getAllWindows().filter((candidate) => candidate !== state.win && !candidate.isDestroyed());
-        const host = windows.find((candidate) => candidate.isVisible()) ?? windows[0];
-        if (!host) return false;
+    const hostWindows = () => BrowserWindow.getAllWindows().filter((candidate) => candidate !== state.win && !candidate.isDestroyed());
+
+    const anyHostFullscreen = () => hostWindows().some((candidate) => {
         try {
-            if (host.isFullScreen()) return true;
-            const bounds = host.getBounds();
-            const display = screen.getDisplayMatching(bounds);
-            const area = display.bounds;
+            if (candidate.isFullScreen()) return true;
+            const bounds = candidate.getBounds();
+            const area = screen.getDisplayMatching(bounds).bounds;
             return bounds.x === area.x && bounds.y === area.y && bounds.width === area.width && bounds.height === area.height;
         } catch {
             return false;
+        }
+    });
+
+    const enterFullscreenSuppression = () => {
+        state.suppressedByFullscreen = true;
+        if (state.win && !state.win.isDestroyed() && state.win.isVisible()) state.win.hide();
+    };
+
+    const leaveFullscreenSuppression = () => {
+        if (!state.suppressedByFullscreen) return;
+        state.suppressedByFullscreen = false;
+        destroyWindow();
+        state.lastStateJson = '';
+        ensureWindow();
+        positionWindow();
+        if (state.lastSnapshot && shouldShow(state.lastSnapshot)) state.win.showInactive();
+    };
+
+    const handleHostGeometry = () => {
+        if (state.disposed) return;
+        if (anyHostFullscreen()) enterFullscreenSuppression();
+        else leaveFullscreenSuppression();
+    };
+
+    // Fullscreen can be Electron's window fullscreen or the web page's own
+    // fullscreen; both are watched, and any window geometry change re-checks.
+    const watchedHosts = new WeakSet();
+    const watchHostWindows = () => {
+        for (const candidate of hostWindows()) {
+            if (watchedHosts.has(candidate)) continue;
+            watchedHosts.add(candidate);
+            const onChange = () => {
+                if (state.disposed) return;
+                if (state.geometryTimer) clearTimeout(state.geometryTimer);
+                state.geometryTimer = setTimeout(handleHostGeometry, 450);
+            };
+            for (const event of ['enter-full-screen', 'leave-full-screen', 'maximize', 'unmaximize', 'resize']) {
+                candidate.on(event, onChange);
+            }
+            try {
+                candidate.webContents.on('enter-html-full-screen', onChange);
+                candidate.webContents.on('leave-html-full-screen', onChange);
+            } catch {
+                /* the window can be mid-destruction */
+            }
         }
     };
 
@@ -210,9 +253,9 @@ module.exports = function activate(api) {
         }
         if (!state.configReady && !snapshot) return;
         state.lastSnapshot = snapshot;
-        if (hostIsFullscreen()) {
-            state.suppressedByFullscreen = true;
-            if (win.isVisible()) win.hide();
+        watchHostWindows();
+        if (anyHostFullscreen()) {
+            enterFullscreenSuppression();
             return;
         }
         // Surface the case where the controller still draws but its commands no
@@ -239,19 +282,14 @@ module.exports = function activate(api) {
     // instead of only when the song changes.
     const keepOnTop = () => {
         if (state.disposed || !state.config.enabled || state.manuallyHidden) return;
-        if (hostIsFullscreen()) {
-            state.suppressedByFullscreen = true;
-            if (state.win && !state.win.isDestroyed() && state.win.isVisible()) state.win.hide();
+        if (anyHostFullscreen()) {
+            enterFullscreenSuppression();
             return;
         }
         if (state.suppressedByFullscreen) {
             // Come back as a new window: input routing after a fullscreen app is
             // not reliable for the old one.
-            state.suppressedByFullscreen = false;
-            destroyWindow();
-            ensureWindow();
-            positionWindow();
-            if (state.lastSnapshot && shouldShow(state.lastSnapshot)) state.win.showInactive();
+            leaveFullscreenSuppression();
             return;
         }
         const win = state.win;
@@ -430,6 +468,13 @@ module.exports = function activate(api) {
     api.rpc.handle('toggleVisible', () => {
         state.manuallyHidden = !state.manuallyHidden;
         state.lastStateJson = '';
+        // Coming back from the global-shortcut hide/show is also the manual
+        // escape hatch when the window's input has gone dead: rebuild it.
+        if (!state.manuallyHidden) {
+            destroyWindow();
+            ensureWindow();
+            positionWindow();
+        }
         tick();
         return state.manuallyHidden;
     });
@@ -491,6 +536,7 @@ module.exports = function activate(api) {
         state.disposed = true;
         clearInterval(timer);
         clearInterval(topTimer);
+        if (state.geometryTimer) clearTimeout(state.geometryTimer);
         ipcMain.removeListener(CMD_CHANNEL, onCommand);
         screen.removeListener('display-metrics-changed', positionWindow);
         screen.removeListener('display-added', positionWindow);
