@@ -2,6 +2,7 @@ const { contextBridge, ipcRenderer } = require('electron');
 
 const STATE_CHANNEL = 'taskbar-player:state';
 const CMD_CHANNEL = 'taskbar-player:cmd';
+const PAGE_CHANNEL = 'taskbar-player:page';
 
 contextBridge.exposeInMainWorld('taskbarPlayer', {
     onState(listener) {
@@ -17,5 +18,8 @@ contextBridge.exposeInMainWorld('taskbarPlayer', {
     },
     sendCommand(name) {
         ipcRenderer.send(CMD_CHANNEL, String(name));
+    },
+    pageEvent(type) {
+        ipcRenderer.send(PAGE_CHANNEL, String(type));
     },
 });

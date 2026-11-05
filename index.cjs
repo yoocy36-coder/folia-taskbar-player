@@ -11,6 +11,7 @@ const path = require('path');
 const { app, BrowserWindow, ipcMain, screen } = require('electron');
 
 const CMD_CHANNEL = 'taskbar-player:cmd';
+const PAGE_CHANNEL = 'taskbar-player:page';
 const STATE_CHANNEL = 'taskbar-player:state';
 const WINDOW_HEIGHT = 44;
 
@@ -101,6 +102,18 @@ module.exports = function activate(api) {
         lastHostWidth: 0,
         lastHostHeight: 0,
         hostSettleTimer: null,
+        selfHidden: false,
+        occluded: false,
+    };
+
+    const hideControllerWindow = () => {
+        state.selfHidden = true;
+        if (state.win && !state.win.isDestroyed() && state.win.isVisible()) state.win.hide();
+    };
+
+    const showControllerWindow = () => {
+        state.selfHidden = false;
+        if (state.win && !state.win.isDestroyed()) state.win.showInactive();
     };
 
     const positionWindow = () => {
@@ -201,11 +214,11 @@ module.exports = function activate(api) {
 
     const enterFullscreenSuppression = () => {
         if (state.suppressedByFullscreen) {
-            if (state.win && !state.win.isDestroyed() && state.win.isVisible()) state.win.hide();
+            hideControllerWindow();
             return;
         }
         state.suppressedByFullscreen = true;
-        if (state.win && !state.win.isDestroyed() && state.win.isVisible()) state.win.hide();
+        hideControllerWindow();
     };
 
     const leaveFullscreenSuppression = () => {
@@ -306,12 +319,19 @@ module.exports = function activate(api) {
         const view = buildView(snapshot);
         if (shouldShow(snapshot)) {
             if (!win.isVisible()) {
-                win.showInactive();
-                state.lastStateJson = '';
+                if (state.selfHidden) {
+                    showControllerWindow();
+                    state.lastStateJson = '';
+                } else {
+                    // Something outside (a screenshot overlay, another topmost
+                    // app) hid the window; its input is not reliable any more.
+                    refreshController();
+                    return;
+                }
             }
             pushState(view);
         } else if (win.isVisible()) {
-            win.hide();
+            hideControllerWindow();
         }
     };
 
@@ -341,9 +361,15 @@ module.exports = function activate(api) {
         if (!shouldShow(state.lastSnapshot)) return;
         try {
             if (!win.isVisible()) {
-                win.showInactive();
-                state.lastStateJson = '';
+                if (state.selfHidden) {
+                    showControllerWindow();
+                    state.lastStateJson = '';
+                } else {
+                    refreshController();
+                    return;
+                }
             }
+            win.setIgnoreMouseEvents(false);
             win.setAlwaysOnTop(true, 'screen-saver');
             win.moveTop();
         } catch {
@@ -545,6 +571,19 @@ module.exports = function activate(api) {
         return commands;
     });
 
+    const onPageEvent = (event, type) => {
+        if (!state.win || event.sender !== state.win.webContents) return;
+        if (type === 'hidden') {
+            state.occluded = true;
+        } else if (type === 'visible' && state.occluded) {
+            state.occluded = false;
+            // The page was fully covered (a screenshot overlay, a fullscreen
+            // app) and is visible again: rebuild so clicks work.
+            refreshController();
+        }
+    };
+    ipcMain.on(PAGE_CHANNEL, onPageEvent);
+
     ipcMain.on(CMD_CHANNEL, onCommand);
 
     // ---- start -------------------------------------------------------------
@@ -577,6 +616,7 @@ module.exports = function activate(api) {
         clearInterval(topTimer);
         if (state.hostSettleTimer) clearTimeout(state.hostSettleTimer);
         ipcMain.removeListener(CMD_CHANNEL, onCommand);
+        ipcMain.removeListener(PAGE_CHANNEL, onPageEvent);
         screen.removeListener('display-metrics-changed', positionWindow);
         screen.removeListener('display-added', positionWindow);
         screen.removeListener('display-removed', positionWindow);

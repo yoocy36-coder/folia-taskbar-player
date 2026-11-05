@@ -78,4 +78,11 @@
     // The main process sends a snapshot on every change; the first one arrives
     // as soon as this page finishes loading.
     if (api) api.onState(render);
+
+    // The main process uses this to notice that a screenshot overlay or a
+    // fullscreen app covered the controller and its input went stale.
+    if (api) {
+        api.pageEvent(document.visibilityState);
+        document.addEventListener('visibilitychange', () => api.pageEvent(document.visibilityState));
+    }
 })();
