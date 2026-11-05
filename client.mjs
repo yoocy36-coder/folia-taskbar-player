@@ -118,21 +118,45 @@ export default function activate(folium) {
     folium.events.on('playback.songChanged', pushMeta);
     folium.events.on('playback.likeChanged', pushMeta);
 
-    // Commands the controller window sends from the taskbar.
-    if (typeof folium.rpc.on === 'function') {
-        folium.rpc.on('command', (command) => {
-            try {
-                if (command === 'toggle') folium.playback.toggle();
-                else if (command === 'next') folium.playback.next();
-                else if (command === 'previous') folium.playback.previous();
-                else if (command === 'prev') folium.playback.previous();
-                else if (command === 'like') folium.playback.toggleLike();
-            } catch {
-                /* the host reports playback failures itself */
-            }
-            pushMeta();
-        });
-    }
+    // Commands the controller window sends from the taskbar. The main entry
+    // pushes them and also queues them; each command carries an id so the push
+    // and the poll cannot run the same press twice.
+    const seenCommands = new Set();
+    const runCommand = (item) => {
+        const name = typeof item === 'string' ? item : item?.name;
+        const id = item && typeof item === 'object' ? item.id : null;
+        if (!name) return;
+        if (id != null) {
+            if (seenCommands.has(id)) return;
+            seenCommands.add(id);
+            if (seenCommands.size > 200) seenCommands.clear();
+        }
+        try {
+            if (name === 'toggle') folium.playback.toggle();
+            else if (name === 'next') folium.playback.next();
+            else if (name === 'previous' || name === 'prev') folium.playback.previous();
+            else if (name === 'like') folium.playback.toggleLike();
+        } catch (error) {
+            folium.log.error('taskbar-player: playback command failed', error?.message);
+        }
+        pushMeta();
+    };
+
+    const pollCommands = () => {
+        folium.rpc
+            .call('pollCommands')
+            .then((list) => {
+                if (Array.isArray(list)) list.forEach(runCommand);
+            })
+            .catch(() => {});
+    };
+
+    if (typeof folium.rpc.on === 'function') folium.rpc.on('command', runCommand);
+    pollCommands();
+    folium.every(300, pollCommands);
+    folium.every(5000, () => {
+        folium.rpc.call('heartbeat').catch(() => {});
+    });
 
     const settingsHandle = folium.registries.settingsSections.register({
         id: 'settings',

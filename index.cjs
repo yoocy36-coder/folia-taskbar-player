@@ -93,6 +93,11 @@ module.exports = function activate(api) {
         manuallyHidden: false,
         disposed: false,
         configReady: false,
+        pendingCommands: [],
+        commandSeq: 0,
+        clientHeartbeat: 0,
+        warnedOfflineClient: false,
+        suppressedByFullscreen: false,
     };
 
     const positionWindow = () => {
@@ -173,6 +178,26 @@ module.exports = function activate(api) {
         }
     };
 
+    // A fullscreen player window (Folia's immersive mode, a game, a video)
+    // covers the taskbar and owns the screen. Keeping a topmost strip over it
+    // leaves a window that Windows no longer routes clicks to after the
+    // fullscreen app goes away, so the controller is hidden while it lasts and
+    // rebuilt fresh afterwards.
+    const hostIsFullscreen = () => {
+        const windows = BrowserWindow.getAllWindows().filter((candidate) => candidate !== state.win && !candidate.isDestroyed());
+        const host = windows.find((candidate) => candidate.isVisible()) ?? windows[0];
+        if (!host) return false;
+        try {
+            if (host.isFullScreen()) return true;
+            const bounds = host.getBounds();
+            const display = screen.getDisplayMatching(bounds);
+            const area = display.bounds;
+            return bounds.x === area.x && bounds.y === area.y && bounds.width === area.width && bounds.height === area.height;
+        } catch {
+            return false;
+        }
+    };
+
     const tick = () => {
         if (state.disposed) return;
         const win = state.win;
@@ -185,6 +210,17 @@ module.exports = function activate(api) {
         }
         if (!state.configReady && !snapshot) return;
         state.lastSnapshot = snapshot;
+        if (hostIsFullscreen()) {
+            state.suppressedByFullscreen = true;
+            if (win.isVisible()) win.hide();
+            return;
+        }
+        // Surface the case where the controller still draws but its commands no
+        // longer reach the client half, instead of silently doing nothing.
+        if (state.pendingCommands.length > 0 && Date.now() - state.clientHeartbeat > 10000 && !state.warnedOfflineClient) {
+            state.warnedOfflineClient = true;
+            api.log.error('播放控制没有响应：界面端可能已停止，请到「设置 → 模组」重载本模组');
+        }
         const view = buildView(snapshot);
         if (shouldShow(snapshot)) {
             if (!win.isVisible()) {
@@ -203,6 +239,21 @@ module.exports = function activate(api) {
     // instead of only when the song changes.
     const keepOnTop = () => {
         if (state.disposed || !state.config.enabled || state.manuallyHidden) return;
+        if (hostIsFullscreen()) {
+            state.suppressedByFullscreen = true;
+            if (state.win && !state.win.isDestroyed() && state.win.isVisible()) state.win.hide();
+            return;
+        }
+        if (state.suppressedByFullscreen) {
+            // Come back as a new window: input routing after a fullscreen app is
+            // not reliable for the old one.
+            state.suppressedByFullscreen = false;
+            destroyWindow();
+            ensureWindow();
+            positionWindow();
+            if (state.lastSnapshot && shouldShow(state.lastSnapshot)) state.win.showInactive();
+            return;
+        }
         const win = state.win;
         if (!win || win.isDestroyed()) {
             // Recover a controller that Windows or a renderer crash took down.
@@ -255,9 +306,20 @@ module.exports = function activate(api) {
             case 'prev':
             case 'next':
             case 'toggle':
-            case 'like':
-                api.rpc.send('command', command);
+            case 'like': {
+                // Two delivery paths: a push to the client for latency, and a
+                // queue the client polls. Whichever arrives first wins; the
+                // client de-duplicates by id.
+                const item = { id: ++state.commandSeq, name: command };
+                state.pendingCommands.push(item);
+                if (state.pendingCommands.length > 10) state.pendingCommands.shift();
+                try {
+                    api.rpc.send('command', item);
+                } catch {
+                    /* the poll path still delivers it */
+                }
                 break;
+            }
             case 'open':
                 focusHostWindow();
                 break;
@@ -383,6 +445,20 @@ module.exports = function activate(api) {
         }
         tick();
         return true;
+    });
+
+    // The client half is alive and listening.
+    api.rpc.handle('heartbeat', () => {
+        state.clientHeartbeat = Date.now();
+        state.warnedOfflineClient = false;
+        return true;
+    });
+
+    // Pull path for commands: works even when a push to the renderer is lost.
+    api.rpc.handle('pollCommands', () => {
+        const commands = state.pendingCommands;
+        state.pendingCommands = [];
+        return commands;
     });
 
     ipcMain.on(CMD_CHANNEL, onCommand);
