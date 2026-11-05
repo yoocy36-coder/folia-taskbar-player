@@ -76,3 +76,9 @@ preview.jpg    模组市场介绍图 (1280×720)
 ## 许可证
 
 MIT，见 [LICENSE](LICENSE)。
+
+## 作者与反馈
+
+Dev by **Fy**（[@yoocy36-coder](https://github.com/yoocy36-coder)）。
+
+用着有问题、想加功能，欢迎到 [本仓库的 issue](https://github.com/yoocy36-coder/folia-taskbar-player/issues) 提，附上 Folia 版本、Windows 版本和复现步骤，方便定位。
