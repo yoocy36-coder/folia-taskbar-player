@@ -70,7 +70,9 @@
     bind(toggle, 'toggle');
     bind(document.getElementById('next'), 'next');
     bind(like, 'like');
+    // Cover (and the title block next to it) opens the Folia main window.
     cover.addEventListener('click', () => api && api.sendCommand('open'));
+    document.querySelector('.meta').addEventListener('click', () => api && api.sendCommand('open'));
     cover.addEventListener('error', () => cover.classList.add('hidden'));
 
     // The main process sends a snapshot on every change; the first one arrives

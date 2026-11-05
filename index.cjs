@@ -8,7 +8,7 @@
 'use strict';
 
 const path = require('path');
-const { BrowserWindow, ipcMain, screen } = require('electron');
+const { app, BrowserWindow, ipcMain, screen } = require('electron');
 
 const CMD_CHANNEL = 'taskbar-player:cmd';
 const STATE_CHANNEL = 'taskbar-player:state';
@@ -228,8 +228,24 @@ module.exports = function activate(api) {
         const host = windows.find((candidate) => candidate.isVisible()) ?? windows[0];
         if (!host) return;
         if (host.isMinimized()) host.restore();
+        // Clicking a cover on a non-focusable window cannot hand it the
+        // foreground the normal way; ask the app for it, then put the main
+        // window back to its previous topmost state.
+        try {
+            app.focus({ steal: true });
+        } catch {
+            /* older Electron */
+        }
+        const wasTop = host.isAlwaysOnTop();
         host.show();
+        host.moveTop();
         host.focus();
+        if (!wasTop) {
+            host.setAlwaysOnTop(true, 'screen-saver');
+            setTimeout(() => {
+                if (!host.isDestroyed()) host.setAlwaysOnTop(false);
+            }, 300);
+        }
     };
 
     const onCommand = (event, command) => {
