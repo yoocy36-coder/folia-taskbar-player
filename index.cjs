@@ -10,6 +10,8 @@
 const path = require('path');
 const { app, BrowserWindow, ipcMain, screen } = require('electron');
 
+
+
 const CMD_CHANNEL = 'taskbar-player:cmd';
 const PAGE_CHANNEL = 'taskbar-player:page';
 const STATE_CHANNEL = 'taskbar-player:state';
@@ -103,6 +105,7 @@ module.exports = function activate(api) {
         lastHostHeight: 0,
         hostSettleTimer: null,
         selfHidden: false,
+        hasShown: false,
         occluded: false,
     };
 
@@ -113,6 +116,7 @@ module.exports = function activate(api) {
 
     const showControllerWindow = () => {
         state.selfHidden = false;
+        state.hasShown = true;
         if (state.win && !state.win.isDestroyed()) state.win.showInactive();
     };
 
@@ -228,7 +232,7 @@ module.exports = function activate(api) {
         state.lastStateJson = '';
         ensureWindow();
         positionWindow();
-        if (state.lastSnapshot && shouldShow(state.lastSnapshot)) state.win.showInactive();
+        if (state.lastSnapshot && shouldShow(state.lastSnapshot)) showControllerWindow();
     };
 
     const refreshController = () => {
@@ -243,7 +247,7 @@ module.exports = function activate(api) {
         state.lastStateJson = '';
         ensureWindow();
         positionWindow();
-        if (state.lastSnapshot && shouldShow(state.lastSnapshot)) state.win.showInactive();
+        if (state.lastSnapshot && shouldShow(state.lastSnapshot)) showControllerWindow();
     };
 
     const handleHostGeometry = () => {
@@ -319,12 +323,10 @@ module.exports = function activate(api) {
         const view = buildView(snapshot);
         if (shouldShow(snapshot)) {
             if (!win.isVisible()) {
-                if (state.selfHidden) {
+                if (!state.hasShown || state.selfHidden) {
                     showControllerWindow();
                     state.lastStateJson = '';
                 } else {
-                    // Something outside (a screenshot overlay, another topmost
-                    // app) hid the window; its input is not reliable any more.
                     refreshController();
                     return;
                 }
@@ -361,7 +363,7 @@ module.exports = function activate(api) {
         if (!shouldShow(state.lastSnapshot)) return;
         try {
             if (!win.isVisible()) {
-                if (state.selfHidden) {
+                if (!state.hasShown || state.selfHidden) {
                     showControllerWindow();
                     state.lastStateJson = '';
                 } else {
@@ -413,7 +415,7 @@ module.exports = function activate(api) {
                 // Two delivery paths: a push to the client for latency, and a
                 // queue the client polls. Whichever arrives first wins; the
                 // client de-duplicates by id.
-                const item = { id: ++state.commandSeq, name: command };
+                        const item = { id: ++state.commandSeq, name: command };
                 state.pendingCommands.push(item);
                 if (state.pendingCommands.length > 10) state.pendingCommands.shift();
                 try {
@@ -446,7 +448,7 @@ module.exports = function activate(api) {
             closable: false,
             fullscreenable: false,
             skipTaskbar: true,
-            focusable: false,
+            focusable: true,
             hasShadow: false,
             alwaysOnTop: true,
             backgroundColor: '#00000000',
@@ -461,6 +463,7 @@ module.exports = function activate(api) {
         });
         state.win = win;
         win.setAlwaysOnTop(true, 'screen-saver');
+        win.setSkipTaskbar(true);
         win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
         win.setMenuBarVisibility(false);
         win.on('closed', () => {
@@ -579,6 +582,11 @@ module.exports = function activate(api) {
             state.occluded = false;
             // The page was fully covered (a screenshot overlay, a fullscreen
             // app) and is visible again: rebuild so clicks work.
+            refreshController();
+        } else if (type === 'stale-click') {
+            // The page received a mouse-up without a mouse-down: the overlay
+            // window state after a screenshot tool ate the press. Rebuild so
+            // the next press is delivered normally.
             refreshController();
         }
     };

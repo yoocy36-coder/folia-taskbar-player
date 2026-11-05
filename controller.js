@@ -59,6 +59,23 @@
         sub.style.opacity = view.lyric ? '1' : '0.75';
     };
 
+    // After a screenshot overlay (QQ 截图, Snipping Tool) Windows sometimes
+    // swallows mouse-down while still delivering mouse-up. Treat a mouse-up
+    // with no recent mouse-down as a click: run the action and ask the main
+    // process to rebuild the window so later presses arrive normally.
+    let lastPointerDown = 0;
+    document.addEventListener('mousedown', () => {
+        lastPointerDown = Date.now();
+    }, true);
+    document.addEventListener('mouseup', (event) => {
+        if (Date.now() - lastPointerDown < 600 || !api) return;
+        const target = event.target instanceof Element ? event.target : null;
+        const button = target && target.closest('button');
+        const command = button ? button.id : target && (target.closest('.cover') || target.closest('.meta')) ? 'open' : null;
+        if (command) api.sendCommand(command);
+        api.pageEvent('stale-click');
+    }, true);
+
     const bind = (element, command) => {
         element.addEventListener('click', (event) => {
             event.stopPropagation();
@@ -84,5 +101,8 @@
     if (api) {
         api.pageEvent(document.visibilityState);
         document.addEventListener('visibilitychange', () => api.pageEvent(document.visibilityState));
+        for (const type of ['mousedown', 'mouseup', 'click']) {
+            document.addEventListener(type, () => api.pageEvent('page ' + type), true);
+        }
     }
 })();
