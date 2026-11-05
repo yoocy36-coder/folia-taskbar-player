@@ -1,0 +1,360 @@
+// taskbar-player / index.cjs
+// Node (main process) half of the mod. It owns a small always-on-top,
+// click-through-free frameless window that sits on the Windows taskbar and
+// shows the song Folia is playing. Playback data comes from the host's public
+// playback snapshot; the renderer half supplies cover art and the liked state,
+// and performs the playback commands this window sends.
+
+'use strict';
+
+const path = require('path');
+const { BrowserWindow, ipcMain, screen } = require('electron');
+
+const CMD_CHANNEL = 'taskbar-player:cmd';
+const STATE_CHANNEL = 'taskbar-player:state';
+const WINDOW_HEIGHT = 44;
+
+const DEFAULT_CONFIG = {
+    enabled: true,
+    showLyric: true,
+    hideWhenPaused: false,
+    width: 380,
+    rightOffset: 300,
+    offsetY: 0,
+    opacity: 0.92,
+    lyricOffsetMs: 0,
+};
+
+const clampNumber = (value, min, max, fallback) => {
+    const number = typeof value === 'number' ? value : Number(value);
+    if (!Number.isFinite(number)) return fallback;
+    return Math.min(max, Math.max(min, number));
+};
+
+const normalizeConfig = (raw) => {
+    const values = raw && typeof raw === 'object' ? raw : {};
+    return {
+        enabled: values.enabled !== false,
+        showLyric: values.showLyric !== false,
+        hideWhenPaused: values.hideWhenPaused === true,
+        width: Math.round(clampNumber(values.width, 260, 900, DEFAULT_CONFIG.width)),
+        rightOffset: Math.round(clampNumber(values.rightOffset, 0, 2000, DEFAULT_CONFIG.rightOffset)),
+        offsetY: Math.round(clampNumber(values.offsetY, -30, 30, DEFAULT_CONFIG.offsetY)),
+        opacity: clampNumber(values.opacity, 0.3, 1, DEFAULT_CONFIG.opacity),
+        lyricOffsetMs: Math.round(clampNumber(values.lyricOffsetMs, -3000, 3000, DEFAULT_CONFIG.lyricOffsetMs)),
+    };
+};
+
+// Last line whose start time is not after `time`; keeps the finished line on
+// screen through the gap that follows it, like the player does.
+const findLine = (lines, time) => {
+    if (!Array.isArray(lines) || lines.length === 0) return null;
+    let low = 0;
+    let high = lines.length - 1;
+    let found = -1;
+    while (low <= high) {
+        const middle = (low + high) >> 1;
+        const start = Number(lines[middle]?.startTime);
+        if (Number.isFinite(start) && start <= time) {
+            found = middle;
+            low = middle + 1;
+        } else {
+            high = middle - 1;
+        }
+    }
+    return found >= 0 ? lines[found] : null;
+};
+
+const taskbarRect = () => {
+    const display = screen.getPrimaryDisplay();
+    const { bounds, workArea } = display;
+    return {
+        bounds,
+        workArea,
+        top: workArea.y - bounds.y,
+        bottom: bounds.y + bounds.height - (workArea.y + workArea.height),
+        left: workArea.x - bounds.x,
+        right: bounds.x + bounds.width - (workArea.x + workArea.width),
+    };
+};
+
+module.exports = function activate(api) {
+    if (process.platform !== 'win32') {
+        api.log.info('taskbar-player only runs on Windows; nothing to do here');
+        return undefined;
+    }
+
+    const state = {
+        config: { ...DEFAULT_CONFIG },
+        meta: { cover: null, liked: false, canLike: false },
+        win: null,
+        lastStateJson: '',
+        manuallyHidden: false,
+        disposed: false,
+        configReady: false,
+    };
+
+    const positionWindow = () => {
+        const win = state.win;
+        if (!win || win.isDestroyed()) return;
+        const { config } = state;
+        const { bounds, workArea, top, bottom } = taskbarRect();
+        const width = config.width;
+        const height = WINDOW_HEIGHT;
+        const rightOffset = config.rightOffset;
+        let x;
+        let y;
+        if (bottom >= 8) {
+            // Taskbar at the bottom: centre the pill in the taskbar strip.
+            x = bounds.x + bounds.width - rightOffset - width;
+            y = workArea.y + workArea.height + Math.round((bottom - height) / 2) + config.offsetY;
+        } else if (top >= 8) {
+            x = bounds.x + bounds.width - rightOffset - width;
+            y = bounds.y + Math.round((top - height) / 2) + config.offsetY;
+        } else {
+            // Auto-hide or side taskbar: keep it at the bottom-right of the work area.
+            x = workArea.x + workArea.width - rightOffset - width;
+            y = workArea.y + workArea.height - height - 2 + config.offsetY;
+        }
+        const maxX = Math.round(bounds.x + bounds.width - width);
+        const maxY = Math.round(bounds.y + bounds.height - height);
+        x = Math.min(maxX, Math.max(bounds.x, Math.round(x)));
+        y = Math.min(maxY, Math.max(bounds.y, Math.round(y)));
+        win.setBounds({ x, y, width, height });
+        win.setOpacity(config.opacity);
+    };
+
+    const shouldShow = (snapshot) => {
+        if (!state.config.enabled || state.manuallyHidden || !snapshot?.song) return false;
+        if (state.config.hideWhenPaused && snapshot.state !== 'playing') return false;
+        return true;
+    };
+
+    const buildView = (snapshot) => {
+        const { config, meta } = state;
+        const song = snapshot?.song ?? null;
+        let lyric = '';
+        let translation = '';
+        if (song && config.showLyric) {
+            const time = Number(snapshot.position) + config.lyricOffsetMs / 1000;
+            const line = findLine(snapshot.lines, time);
+            if (line) {
+                lyric = typeof line.fullText === 'string' ? line.fullText : '';
+                translation = typeof line.translation === 'string' ? line.translation : '';
+            }
+        }
+        return {
+            idle: !song,
+            playing: snapshot?.state === 'playing',
+            title: song?.title ?? '',
+            artist: song?.artist ?? '',
+            lyric,
+            translation,
+            cover: meta?.cover ?? null,
+            liked: Boolean(meta?.liked),
+            canLike: Boolean(meta?.canLike),
+            position: Number(snapshot?.position) || 0,
+            duration: Number(snapshot?.duration) || 0,
+            accent: snapshot?.theme?.accentColor ?? null,
+        };
+    };
+
+    const pushState = (view) => {
+        const win = state.win;
+        if (!win || win.isDestroyed()) return;
+        const json = JSON.stringify(view);
+        if (json === state.lastStateJson) return;
+        state.lastStateJson = json;
+        try {
+            win.webContents.send(STATE_CHANNEL, view);
+        } catch {
+            /* window may be mid-reload */
+        }
+    };
+
+    const tick = () => {
+        if (state.disposed) return;
+        const win = state.win;
+        if (!win || win.isDestroyed()) return;
+        let snapshot = null;
+        try {
+            snapshot = api.runtime.getPlaybackSnapshot();
+        } catch {
+            return;
+        }
+        if (!state.configReady && !snapshot) return;
+        const view = buildView(snapshot);
+        if (shouldShow(snapshot)) {
+            if (!win.isVisible()) {
+                win.showInactive();
+                state.lastStateJson = '';
+            }
+            pushState(view);
+        } else if (win.isVisible()) {
+            win.hide();
+        }
+    };
+
+    const focusHostWindow = () => {
+        const windows = BrowserWindow.getAllWindows().filter((candidate) => candidate !== state.win && !candidate.isDestroyed());
+        const host = windows.find((candidate) => candidate.isVisible()) ?? windows[0];
+        if (!host) return;
+        if (host.isMinimized()) host.restore();
+        host.show();
+        host.focus();
+    };
+
+    const onCommand = (event, command) => {
+        if (!state.win || event.sender !== state.win.webContents) return;
+        if (typeof command !== 'string') return;
+        switch (command) {
+            case 'prev':
+            case 'next':
+            case 'toggle':
+            case 'like':
+                api.rpc.send('command', command);
+                break;
+            case 'open':
+                focusHostWindow();
+                break;
+            default:
+                break;
+        }
+    };
+
+    const ensureWindow = () => {
+        if (state.win && !state.win.isDestroyed()) return;
+        const win = new BrowserWindow({
+            width: state.config.width,
+            height: WINDOW_HEIGHT,
+            show: false,
+            frame: false,
+            transparent: true,
+            resizable: false,
+            movable: false,
+            minimizable: false,
+            maximizable: false,
+            closable: false,
+            fullscreenable: false,
+            skipTaskbar: true,
+            focusable: false,
+            hasShadow: false,
+            alwaysOnTop: true,
+            backgroundColor: '#00000000',
+            webPreferences: {
+                preload: path.join(__dirname, 'preload.cjs'),
+                nodeIntegration: false,
+                contextIsolation: true,
+                sandbox: true,
+                devTools: false,
+                backgroundThrottling: false,
+            },
+        });
+        state.win = win;
+        win.setAlwaysOnTop(true, 'screen-saver');
+        win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+        win.setMenuBarVisibility(false);
+        win.on('closed', () => {
+            if (state.win === win) state.win = null;
+        });
+        win.webContents.on('did-finish-load', () => {
+            state.lastStateJson = '';
+            tick();
+        });
+        win.loadFile(path.join(__dirname, 'controller.html')).catch((error) => api.log.error('taskbar-player window failed to load', error?.message));
+        positionWindow();
+    };
+
+    const destroyWindow = () => {
+        const win = state.win;
+        state.win = null;
+        state.lastStateJson = '';
+        if (win && !win.isDestroyed()) win.destroy();
+    };
+
+    const applyConfig = () => {
+        if (state.disposed) return;
+        if (!state.config.enabled) {
+            destroyWindow();
+            return;
+        }
+        ensureWindow();
+        positionWindow();
+    };
+
+    const saveConfig = () => {
+        api.storage.set('config', state.config).catch((error) => api.log.warn('taskbar-player could not save its settings', error?.message));
+    };
+
+    const sanitizeIncoming = (values) => normalizeConfig({ ...state.config, ...(values && typeof values === 'object' ? values : {}) });
+
+    // ---- API surface -------------------------------------------------------
+
+    api.rpc.handle('config', (values) => {
+        state.config = sanitizeIncoming(values);
+        state.configReady = true;
+        applyConfig();
+        saveConfig();
+        tick();
+        return state.config;
+    });
+
+    api.rpc.handle('toggleVisible', () => {
+        state.manuallyHidden = !state.manuallyHidden;
+        state.lastStateJson = '';
+        tick();
+        return state.manuallyHidden;
+    });
+
+    api.rpc.handle('state', (meta) => {
+        if (meta && typeof meta === 'object') {
+            state.meta = {
+                cover: typeof meta.cover === 'string' ? meta.cover : null,
+                liked: Boolean(meta.liked),
+                canLike: Boolean(meta.canLike),
+            };
+            state.lastStateJson = '';
+        }
+        tick();
+        return true;
+    });
+
+    ipcMain.on(CMD_CHANNEL, onCommand);
+
+    // ---- start -------------------------------------------------------------
+
+    api.storage
+        .get('config')
+        .then((stored) => {
+            if (state.disposed) return;
+            state.config = normalizeConfig(stored ?? DEFAULT_CONFIG);
+            state.configReady = true;
+            applyConfig();
+        })
+        .catch((error) => {
+            api.log.warn('taskbar-player could not read its settings', error?.message);
+            state.configReady = true;
+            applyConfig();
+        });
+
+    screen.on('display-metrics-changed', positionWindow);
+    screen.on('display-added', positionWindow);
+    screen.on('display-removed', positionWindow);
+
+    const timer = setInterval(tick, 250);
+
+    const dispose = () => {
+        if (state.disposed) return;
+        state.disposed = true;
+        clearInterval(timer);
+        ipcMain.removeListener(CMD_CHANNEL, onCommand);
+        screen.removeListener('display-metrics-changed', positionWindow);
+        screen.removeListener('display-added', positionWindow);
+        screen.removeListener('display-removed', positionWindow);
+        destroyWindow();
+        api.log.info('taskbar-player stopped');
+    };
+
+    api.onDispose(dispose);
+    api.log.info(`taskbar-player ${api.manifest.version} loaded`);
+};
