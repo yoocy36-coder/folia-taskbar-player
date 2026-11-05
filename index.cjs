@@ -89,6 +89,7 @@ module.exports = function activate(api) {
         meta: { cover: null, liked: false, canLike: false },
         win: null,
         lastStateJson: '',
+        lastSnapshot: null,
         manuallyHidden: false,
         disposed: false,
         configReady: false,
@@ -183,6 +184,7 @@ module.exports = function activate(api) {
             return;
         }
         if (!state.configReady && !snapshot) return;
+        state.lastSnapshot = snapshot;
         const view = buildView(snapshot);
         if (shouldShow(snapshot)) {
             if (!win.isVisible()) {
@@ -192,6 +194,32 @@ module.exports = function activate(api) {
             pushState(view);
         } else if (win.isVisible()) {
             win.hide();
+        }
+    };
+
+    // The taskbar itself is a topmost window, and so are fullscreen apps and the
+    // Snipping Tool overlay. A window that sat above them once can end up behind
+    // them after they close, so the controller re-asserts its place regularly
+    // instead of only when the song changes.
+    const keepOnTop = () => {
+        if (state.disposed || !state.config.enabled || state.manuallyHidden) return;
+        const win = state.win;
+        if (!win || win.isDestroyed()) {
+            // Recover a controller that Windows or a renderer crash took down.
+            ensureWindow();
+            positionWindow();
+            return;
+        }
+        if (!shouldShow(state.lastSnapshot)) return;
+        try {
+            if (!win.isVisible()) {
+                win.showInactive();
+                state.lastStateJson = '';
+            }
+            win.setAlwaysOnTop(true, 'screen-saver');
+            win.moveTop();
+        } catch {
+            /* the window is going away; the next tick recreates it */
         }
     };
 
@@ -256,6 +284,28 @@ module.exports = function activate(api) {
         win.setMenuBarVisibility(false);
         win.on('closed', () => {
             if (state.win === win) state.win = null;
+        });
+        // A transparent always-on-top window can lose its renderer (GPU reset,
+        // driver update); rebuild it instead of leaving an empty strip behind.
+        win.webContents.on('render-process-gone', (_event, details) => {
+            if (state.win !== win || state.disposed) return;
+            api.log.error(`taskbar-player controller renderer stopped (${details?.reason ?? 'unknown'}); recreating`);
+            destroyWindow();
+            setTimeout(() => {
+                if (!state.disposed && state.config.enabled) {
+                    ensureWindow();
+                    positionWindow();
+                }
+            }, 800);
+        });
+        win.on('unresponsive', () => {
+            if (state.win !== win || state.disposed) return;
+            api.log.warn('taskbar-player controller unresponsive; reloading');
+            try {
+                win.webContents.reload();
+            } catch {
+                /* recreate on the next keep-on-top pass */
+            }
         });
         win.webContents.on('did-finish-load', () => {
             state.lastStateJson = '';
@@ -342,11 +392,13 @@ module.exports = function activate(api) {
     screen.on('display-removed', positionWindow);
 
     const timer = setInterval(tick, 250);
+    const topTimer = setInterval(keepOnTop, 1200);
 
     const dispose = () => {
         if (state.disposed) return;
         state.disposed = true;
         clearInterval(timer);
+        clearInterval(topTimer);
         ipcMain.removeListener(CMD_CHANNEL, onCommand);
         screen.removeListener('display-metrics-changed', positionWindow);
         screen.removeListener('display-added', positionWindow);
