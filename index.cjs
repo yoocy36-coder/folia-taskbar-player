@@ -98,6 +98,9 @@ module.exports = function activate(api) {
         clientHeartbeat: 0,
         warnedOfflineClient: false,
         suppressedByFullscreen: false,
+        lastHostWidth: 0,
+        lastHostHeight: 0,
+        hostSettleTimer: null,
     };
 
     const positionWindow = () => {
@@ -197,6 +200,10 @@ module.exports = function activate(api) {
     });
 
     const enterFullscreenSuppression = () => {
+        if (state.suppressedByFullscreen) {
+            if (state.win && !state.win.isDestroyed() && state.win.isVisible()) state.win.hide();
+            return;
+        }
         state.suppressedByFullscreen = true;
         if (state.win && !state.win.isDestroyed() && state.win.isVisible()) state.win.hide();
     };
@@ -204,6 +211,21 @@ module.exports = function activate(api) {
     const leaveFullscreenSuppression = () => {
         if (!state.suppressedByFullscreen) return;
         state.suppressedByFullscreen = false;
+        destroyWindow();
+        state.lastStateJson = '';
+        ensureWindow();
+        positionWindow();
+        if (state.lastSnapshot && shouldShow(state.lastSnapshot)) state.win.showInactive();
+    };
+
+    const refreshController = () => {
+        if (state.disposed) return;
+        state.hostSettleTimer = null;
+        if (anyHostFullscreen()) {
+            enterFullscreenSuppression();
+            return;
+        }
+        if (!state.config.enabled) return;
         destroyWindow();
         state.lastStateJson = '';
         ensureWindow();
@@ -224,10 +246,10 @@ module.exports = function activate(api) {
         for (const candidate of hostWindows()) {
             if (watchedHosts.has(candidate)) continue;
             watchedHosts.add(candidate);
-            const onChange = () => {
+            const onChange = (eventName) => {
                 if (state.disposed) return;
-                if (state.geometryTimer) clearTimeout(state.geometryTimer);
-                state.geometryTimer = setTimeout(handleHostGeometry, 450);
+                if (state.hostSettleTimer) clearTimeout(state.hostSettleTimer);
+                state.hostSettleTimer = setTimeout(handleHostGeometry, 450);
             };
             for (const event of ['enter-full-screen', 'leave-full-screen', 'maximize', 'unmaximize', 'resize']) {
                 candidate.on(event, onChange);
@@ -254,7 +276,24 @@ module.exports = function activate(api) {
         if (!state.configReady && !snapshot) return;
         state.lastSnapshot = snapshot;
         watchHostWindows();
-        if (anyHostFullscreen()) {
+        const visibleHost = hostWindows().find((candidate) => candidate.isVisible()) ?? hostWindows()[0];
+        if (visibleHost) {
+            try {
+                const bounds = visibleHost.getBounds();
+                if (bounds.width !== state.lastHostWidth || bounds.height !== state.lastHostHeight) {
+                    if (state.lastHostWidth !== 0 && state.lastHostHeight !== 0) {
+                        if (state.hostSettleTimer) clearTimeout(state.hostSettleTimer);
+                        state.hostSettleTimer = setTimeout(refreshController, 700);
+                    }
+                    state.lastHostWidth = bounds.width;
+                    state.lastHostHeight = bounds.height;
+                }
+            } catch {
+                /* window is going away */
+            }
+        }
+        const fullscreen = anyHostFullscreen();
+        if (fullscreen) {
             enterFullscreenSuppression();
             return;
         }
@@ -536,7 +575,7 @@ module.exports = function activate(api) {
         state.disposed = true;
         clearInterval(timer);
         clearInterval(topTimer);
-        if (state.geometryTimer) clearTimeout(state.geometryTimer);
+        if (state.hostSettleTimer) clearTimeout(state.hostSettleTimer);
         ipcMain.removeListener(CMD_CHANNEL, onCommand);
         screen.removeListener('display-metrics-changed', positionWindow);
         screen.removeListener('display-added', positionWindow);
