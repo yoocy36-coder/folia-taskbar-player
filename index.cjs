@@ -232,7 +232,10 @@ module.exports = function activate(api) {
         state.lastStateJson = '';
         ensureWindow();
         positionWindow();
-        if (state.lastSnapshot && shouldShow(state.lastSnapshot)) showControllerWindow();
+        if (state.lastSnapshot && shouldShow(state.lastSnapshot)) {
+            showControllerWindow();
+            keepOnTop();
+        }
     };
 
     const refreshController = () => {
@@ -247,7 +250,10 @@ module.exports = function activate(api) {
         state.lastStateJson = '';
         ensureWindow();
         positionWindow();
-        if (state.lastSnapshot && shouldShow(state.lastSnapshot)) showControllerWindow();
+        if (state.lastSnapshot && shouldShow(state.lastSnapshot)) {
+            showControllerWindow();
+            keepOnTop();
+        }
     };
 
     const handleHostGeometry = () => {
@@ -494,7 +500,9 @@ module.exports = function activate(api) {
         win.webContents.on('did-finish-load', () => {
             state.lastStateJson = '';
             tick();
+            keepOnTop();
         });
+        win.on('show', () => keepOnTop());
         win.loadFile(path.join(__dirname, 'controller.html')).catch((error) => api.log.error('taskbar-player window failed to load', error?.message));
         positionWindow();
     };
@@ -610,18 +618,19 @@ module.exports = function activate(api) {
             applyConfig();
         });
 
-    screen.on('display-metrics-changed', positionWindow);
+    screen.on('display-metrics-changed', () => {
+        positionWindow();
+        keepOnTop();
+    });
     screen.on('display-added', positionWindow);
     screen.on('display-removed', positionWindow);
 
     const timer = setInterval(tick, 250);
-    const topTimer = setInterval(keepOnTop, 1200);
 
     const dispose = () => {
         if (state.disposed) return;
         state.disposed = true;
         clearInterval(timer);
-        clearInterval(topTimer);
         if (state.hostSettleTimer) clearTimeout(state.hostSettleTimer);
         ipcMain.removeListener(CMD_CHANNEL, onCommand);
         ipcMain.removeListener(PAGE_CHANNEL, onPageEvent);
